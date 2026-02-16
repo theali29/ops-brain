@@ -1,5 +1,3 @@
-
-
 create schema if not exists ops;
 
 -- ---- Enums for cleanliness / safety ----
@@ -54,6 +52,7 @@ create index if not exists dim_sku_variant_idx
 create table if not exists ops.fact_shopify_orders (
   order_id            bigint primary key,            -- Shopify order id
   order_number        text,
+  customer_id         bigint,
   processed_at        timestamptz not null,
   created_at_shopify  timestamptz,
   currency            text not null,
@@ -64,7 +63,7 @@ create table if not exists ops.fact_shopify_orders (
   tags                text[],
   is_test             boolean not null default false,
   source              ops.data_source not null default 'shopify',
-  raw                 jsonb not null default '{}'::jsonb, -- keep for debugging
+  raw                 jsonb not null default '{}'::jsonb, -- for debugging
   ingested_at         timestamptz not null default now()
 );
 
@@ -73,24 +72,25 @@ create index if not exists shopify_orders_processed_idx
 
 -- Line items: SKU-level units and revenue attribution
 create table if not exists ops.fact_shopify_order_line_items (
-  id                  bigserial primary key,
-  order_id            bigint not null references ops.fact_shopify_orders(order_id) on delete cascade,
-  line_item_id        bigint not null,               -- unique within order
-  sku                 text not null references ops.dim_sku(sku),
-  shopify_product_id  bigint,
-  shopify_variant_id  bigint,
-  title               text,
-  variant_title       text,
-  quantity            integer not null check (quantity <> 0),
+  id                         bigserial primary key,
+  order_id                   bigint not null references ops.fact_shopify_orders(order_id) on delete cascade,
+  line_item_id               bigint not null,               -- unique within order
+  sku                        text not null references ops.dim_sku(sku),
+  shopify_product_id         bigint,
+  shopify_variant_id         bigint,
+  shopify_inventory_item_id  bigint, 
+  title                      text,
+  variant_title              text,
+  quantity                   integer not null check (quantity <> 0),
+  fulfillment_service        text,
+  gross_item_revenue         numeric(18,2) not null default 0, -- pre-discount
+  discount_amount            numeric(18,2) not null default 0,
+  tax_amount                 numeric(18,2) not null default 0,
+  net_item_revenue           numeric(18,2) not null default 0, -- gross - discount (refunds separate)
 
-  gross_item_revenue  numeric(18,2) not null default 0, -- pre-discount
-  discount_amount     numeric(18,2) not null default 0,
-  tax_amount          numeric(18,2) not null default 0,
-  net_item_revenue    numeric(18,2) not null default 0, -- gross - discount (refunds separate)
-
-  is_subscription     boolean not null default false,
-  source              ops.data_source not null default 'shopify',
-  ingested_at         timestamptz not null default now(),
+  is_subscription            boolean not null default false,
+  source                     ops.data_source not null default 'shopify',
+  ingested_at                timestamptz not null default now(),
 
   unique (order_id, line_item_id)
 );
@@ -138,10 +138,7 @@ create table if not exists ops.fact_inventory_snapshot (
   sku              text not null references ops.dim_sku(sku),
   shopify_variant_id bigint,
   location_name    text not null default 'all', -- 'US Warehouse', 'ShipRelay', etc or 'all'
-  on_hand          integer not null,
-  committed        integer not null,
   available        integer not null,            -- can be negative (backorders)
-  unavailable      integer not null,
   source           ops.data_source not null default 'shopify',
   raw              jsonb not null default '{}'::jsonb, -- helpful for debugging location mapping
   ingested_at      timestamptz not null default now(),
@@ -154,7 +151,7 @@ create index if not exists inv_snapshot_sku_date_idx
 create or replace view ops.v_latest_inventory as
 select distinct on (sku, location_name)
   sku, location_name, snapshot_date,
-  on_hand, committed, available, unavailable,
+  available,
   ingested_at
 from ops.fact_inventory_snapshot
 order by sku, location_name, snapshot_date desc, ingested_at desc;
