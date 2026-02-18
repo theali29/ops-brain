@@ -219,3 +219,8 @@ create table if not exists ops.dim_sku_financials (
   source                     ops.data_source not null default 'google_sheets',
   ingested_at                timestamptz not null default now()
 );
+create table if not exists ops.sync_state (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);

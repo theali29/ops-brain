@@ -17,3 +17,7 @@ yarn-error.log*
 # optional
 dist/
 build/
+
+scripts/syncs/*.json
+syncs/*.json
+
