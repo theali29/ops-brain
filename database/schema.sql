@@ -224,3 +224,7 @@ create table if not exists ops.sync_state (
   value jsonb not null,
   updated_at timestamptz not null default now()
 );
+
+create unique index if not exists refund_line_items_uniq
+  on ops.fact_shopify_refund_line_items (refund_id, line_item_id)
+  where line_item_id is not null;
