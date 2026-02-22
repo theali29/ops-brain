@@ -1,0 +1,29 @@
+name: Shopify Daily Sync
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 12AM UTC daily
+  workflow_dispatch:     
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm install
+
+      - run: node scripts/shopify_sync_orders_daily.js
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHOPIFY_RPS: 2
+          DEFAULT_LOOKBACK_DAYS: 7
+          OVERLAP_HOURS: 48
