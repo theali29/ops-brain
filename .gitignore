@@ -19,5 +19,5 @@ dist/
 build/
 
 scripts/syncs/*.json
+scripts/scripts/loop_payload_samples/*.json
 syncs/*.json
-

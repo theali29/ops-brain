@@ -1,0 +1,32 @@
+name: Loop Subscriptions Daily Sync
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 12AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Run Loop subscriptions daily sync
+        run: node scripts/loop_sync_subscriptions_daily.js
+        env:
+          LOOP_BASE_URL: ${{ secrets.LOOP_BASE_URL }}
+          LOOP_ADMIN_TOKEN: ${{ secrets.LOOP_ADMIN_TOKEN }}
+          LOOP_API_VERSION: ${{ secrets.LOOP_API_VERSION }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LOOP_RPS: 2
+          DEFAULT_LOOKBACK_DAYS: 7
+          OVERLAP_HOURS: 48

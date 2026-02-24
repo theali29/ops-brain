@@ -194,7 +194,7 @@ create table if not exists ops.fact_demand_forecast (
 create index if not exists demand_forecast_sku_month_idx
   on ops.fact_demand_forecast (sku, month);
 
--- Reorder policy (from Reorder Settings)
+-- Reorder policy 
 create table if not exists ops.dim_reorder_rules (
   sku                      text primary key references ops.dim_sku(sku),
   lead_time_months          numeric(6,2) not null check (lead_time_months >= 0),
@@ -206,7 +206,7 @@ create table if not exists ops.dim_reorder_rules (
   ingested_at              timestamptz not null default now()
 );
 
--- Unit economics / SKU financials (from Unit Economics sheet)
+-- Unit economics / SKU financials
 create table if not exists ops.dim_sku_financials (
   sku                        text primary key references ops.dim_sku(sku),
   unit_sell_price            numeric(18,2),
@@ -228,3 +228,210 @@ create table if not exists ops.sync_state (
 create unique index if not exists refund_line_items_uniq
   on ops.fact_shopify_refund_line_items (refund_id, line_item_id)
   where line_item_id is not null;
+
+-- Subscription header (1 row per Loop subscription)
+create table if not exists ops.fact_loop_subscriptions (
+  subscription_id            bigint primary key,                 -- Loop internal id
+  shopify_subscription_id    bigint,                             -- Loop field: shopifyId
+  origin_order_shopify_id    bigint,                             -- Loop field: originOrderShopifyId
+
+  loop_customer_id           bigint,                             -- Loop customer.id
+  shopify_customer_id        bigint,                             -- Loop customer.shopifyId
+
+  status                     text not null,                      -- ACTIVE | PAUSED | CANCELLED | EXPIRED
+  created_at_loop            timestamptz,
+  updated_at_loop            timestamptz,
+
+  paused_at                  timestamptz,
+  cancelled_at               timestamptz,
+
+  cancellation_reason        text,
+  cancellation_comment       text,
+
+  completed_orders_count     integer,
+
+  is_prepaid                 boolean,
+  is_marked_for_cancellation boolean,
+
+  last_payment_status        text,                               -- SUCCESS / FAILED etc
+  currency_code              text,
+
+  -- pricing rollups on the contract (optional but useful)
+  total_line_item_price              numeric(18,2),
+  total_line_item_discounted_price   numeric(18,2),
+  delivery_price                     numeric(18,2),
+
+  -- renewal timing
+  next_billing_date_epoch    bigint,                             -- as provided by Loop
+  next_billing_at            timestamptz,                         -- derived at ingestion time for easy SQL
+
+  -- cadence (from billingPolicy / deliveryPolicy)
+  billing_interval           text,                               -- e.g. MONTH
+  billing_interval_count     integer,
+  delivery_interval          text,
+  delivery_interval_count    integer,
+
+  -- logistics
+  delivery_method_code       text,
+  delivery_method_title      text,
+
+  shipping_city              text,
+  shipping_zip               text,
+  shipping_country_code      text,
+  shipping_province_code     text,
+
+  source                     ops.data_source not null default 'loop',
+  raw                        jsonb not null default '{}'::jsonb,
+  ingested_at                timestamptz not null default now()
+);
+
+create index if not exists loop_subscriptions_status_idx
+  on ops.fact_loop_subscriptions (status);
+
+create index if not exists loop_subscriptions_next_billing_idx
+  on ops.fact_loop_subscriptions (next_billing_at);
+
+create index if not exists loop_subscriptions_updated_idx
+  on ops.fact_loop_subscriptions (updated_at_loop desc);
+
+create index if not exists loop_subscriptions_shopify_customer_idx
+  on ops.fact_loop_subscriptions (shopify_customer_id);
+
+
+-- Subscription lines
+create table if not exists ops.fact_loop_subscription_lines (
+  id                        bigserial primary key,
+
+  subscription_id           bigint not null references ops.fact_loop_subscriptions(subscription_id) on delete cascade,
+  line_id                   bigint not null,                   
+
+  sku                       text references ops.dim_sku(sku),    -- nullable if missing
+  quantity                  integer not null check (quantity >= 0),
+
+  product_shopify_id        bigint,
+  variant_shopify_id        bigint,
+
+  selling_plan_shopify_id   bigint,
+  selling_plan_name         text,
+  selling_plan_group_name   text,
+  selling_plan_group_merchant_code text,
+
+  product_title             text,
+  variant_title             text,
+  line_name                 text,
+
+  price                     numeric(18,2),
+  base_price                numeric(18,2),
+  discounted_price          numeric(18,2),
+
+  is_one_time_added         boolean,
+  is_one_time_removed       boolean,
+
+  weight_in_grams           integer,
+
+  source                    ops.data_source not null default 'loop',
+  raw                       jsonb not null default '{}'::jsonb,
+  ingested_at               timestamptz not null default now(),
+
+  unique (subscription_id, line_id)
+);
+
+create index if not exists loop_sub_lines_sku_idx
+  on ops.fact_loop_subscription_lines (sku);
+
+create index if not exists loop_sub_lines_variant_idx
+  on ops.fact_loop_subscription_lines (variant_shopify_id);
+
+
+-- C) Loop orders header (1 row per Loop order event)
+create table if not exists ops.fact_loop_orders (
+  loop_order_id            bigint primary key,                 -- Loop order id
+  shopify_order_id         bigint,                             -- Loop field: shopifyId
+  shopify_order_number     bigint,                           
+
+  status                   text,                               -- PROCESSED, etc
+  fulfillment_status       text,
+  financial_status         text,
+
+  billing_date_epoch       bigint,
+  billing_at               timestamptz,
+
+  shopify_created_at       timestamptz,
+  shopify_processed_at     timestamptz,
+  shopify_updated_at       timestamptz,
+
+  currency_code            text,
+
+  total_price              numeric(18,2),
+  total_price_usd          numeric(18,2),
+  total_tax                numeric(18,2),
+  total_discount           numeric(18,2),
+  total_line_items_price   numeric(18,2),
+  total_shipping_price     numeric(18,2),
+
+  is_checkout_order        boolean,
+  order_type               text,  
+
+  updated_at_loop          timestamptz,
+
+  loop_customer_id         bigint,
+  shopify_customer_id      bigint,
+
+  subscription_id          bigint references ops.fact_loop_subscriptions(subscription_id),
+
+  shipping_city            text,
+  shipping_zip             text,
+  shipping_country_code    text,
+  shipping_province_code   text,
+
+  source                   ops.data_source not null default 'loop',
+  raw                      jsonb not null default '{}'::jsonb,
+  ingested_at              timestamptz not null default now()
+);
+
+create index if not exists loop_orders_subscription_idx
+  on ops.fact_loop_orders (subscription_id);
+
+create index if not exists loop_orders_billing_at_idx
+  on ops.fact_loop_orders (billing_at);
+
+create index if not exists loop_orders_updated_idx
+  on ops.fact_loop_orders (updated_at_loop desc);
+
+create index if not exists loop_orders_shopify_order_idx
+  on ops.fact_loop_orders (shopify_order_id);
+
+
+-- D) Loop order lines (SKU-level order items)
+create table if not exists ops.fact_loop_order_lines (
+  id                       bigserial primary key,
+
+  loop_order_id            bigint not null references ops.fact_loop_orders(loop_order_id) on delete cascade,
+
+  sku                      text references ops.dim_sku(sku),
+  quantity                 integer not null check (quantity >= 0),
+  price                    numeric(18,2),
+
+  product_shopify_id       bigint,
+  variant_shopify_id       bigint,
+
+  product_title            text,
+  variant_title            text,
+  line_name                text,
+
+  is_one_time              boolean not null default false,
+  current_quantity         integer,
+
+  source                   ops.data_source not null default 'loop',
+  raw                      jsonb not null default '{}'::jsonb,
+  ingested_at              timestamptz not null default now()
+);
+
+create unique index if not exists loop_order_lines_uniq
+  on ops.fact_loop_order_lines (loop_order_id, coalesce(variant_shopify_id, 0), coalesce(sku, ''), is_one_time);
+
+create index if not exists loop_order_lines_sku_idx
+  on ops.fact_loop_order_lines (sku);
+
+create index if not exists loop_order_lines_variant_idx
+  on ops.fact_loop_order_lines (variant_shopify_id);
