@@ -3,49 +3,26 @@
 const path = require("path");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 
-const { pool } = require("../config/db");
+const { withIngestionRun } = require("./lib/ingestionRun");
 const { createLoopClient, epochToIso } = require("./lib/loop");
 
 const PIPELINE = "loop_subscriptions_backfill";
+const SOURCE = "loop";
 const PAGE_SIZE = Math.min(Number(process.env.LOOP_PAGE_SIZE || 50), 50);
+
+const LOOP_SUBSCRIPTIONS_PATH = "/subscription";
 
 const loop = createLoopClient();
 
-async function startIngestionRun(metadata) {
-  const q = `
-    insert into ops.ingestion_runs (source, pipeline, status, metadata)
-    values ('loop', $1, 'started', $2::jsonb)
-    returning id
-  `;
-  const res = await pool.query(q, [PIPELINE, JSON.stringify(metadata || {})]);
-  return res.rows[0].id;
-}
-
-async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, errorMessage, metadataPatch) {
-  const q = `
-    update ops.ingestion_runs
-    set finished_at = now(),
-        status = $2::ops.sync_status,
-        rows_upserted = $3,
-        rows_deleted = $4,
-        error_message = $5,
-        metadata = metadata || $6::jsonb
-    where id = $1
-  `;
-  await pool.query(q, [
-    runId,
-    status,
-    rowsUpserted || 0,
-    rowsDeleted || 0,
-    errorMessage || null,
-    JSON.stringify(metadataPatch || {}),
-  ]);
-}
-
 // ---- DB upserts ----
 async function upsertSubscriptionHeader(client, sub) {
-  // Derive next_billing_at for queryability
   const nextBillingAtIso = epochToIso(sub.nextBillingDateEpoch);
+
+  const shipping = sub.shippingAddress || {};
+  const billingPolicy = sub.billingPolicy || {};
+  const deliveryPolicy = sub.deliveryPolicy || {};
+  const deliveryMethod = sub.deliveryMethod || {};
+  const customer = sub.customer || {};
 
   const q = `
     insert into ops.fact_loop_subscriptions
@@ -116,12 +93,6 @@ async function upsertSubscriptionHeader(client, sub) {
        ingested_at = now()
   `;
 
-  const shipping = sub.shippingAddress || {};
-  const billingPolicy = sub.billingPolicy || {};
-  const deliveryPolicy = sub.deliveryPolicy || {};
-  const deliveryMethod = sub.deliveryMethod || {};
-  const customer = sub.customer || {};
-
   await client.query(q, [
     sub.id ?? null,
     sub.shopifyId ?? null,
@@ -174,11 +145,9 @@ async function upsertSubscriptionHeader(client, sub) {
 }
 
 async function ensureSkuExistsBestEffort(client, sku, attrs) {
-  // If SKU missing, do nothing
   const s = (sku || "").trim();
   if (!s) return false;
 
-  // If exists, no-op
   const check = await client.query("select 1 from ops.dim_sku where sku = $1 limit 1", [s]);
   if (check.rowCount) return false;
 
@@ -208,8 +177,8 @@ async function ensureSkuExistsBestEffort(client, sku, attrs) {
 }
 
 async function upsertSubscriptionLine(client, subscriptionId, line) {
-  // Best-effort ensure SKU exists (so FK doesn’t block ingestion)
   let stubInserted = false;
+
   if (line?.sku) {
     stubInserted = await ensureSkuExistsBestEffort(client, line.sku, {
       product_title: line.productTitle ?? null,
@@ -300,81 +269,74 @@ async function upsertSubscriptionLine(client, subscriptionId, line) {
 }
 
 async function main() {
-  const runMeta = {
-    page_size: PAGE_SIZE,
-    started_at: new Date().toISOString(),
-  };
+  await withIngestionRun(
+    {
+      source: SOURCE,
+      pipeline: PIPELINE,
+      metadata: {
+        endpoint: LOOP_SUBSCRIPTIONS_PATH,
+        page_size: PAGE_SIZE,
+        started_at: new Date().toISOString(),
+      },
+    },
+    async (ctx) => {
+      let stubSkusInserted = 0;
 
-  const runId = await startIngestionRun(runMeta);
-
-  let rowsUpserted = 0;
-  let stubSkusInserted = 0;
-
-  const client = await pool.connect();
-
-  try {
-    let pageNo = 1;
-
-    while (true) {
-        // fetch page from loop
-      const { data, pageInfo } = await loop.getPaged("/subscription", {
-        pageNo,
-        pageSize: PAGE_SIZE,
-      });
-
-      if (!data.length) {
-        break;
-      }
-
-      // Transaction per page
-      await client.query("BEGIN");
+      const client = await ctx.pool.connect();
+      ctx.setClient(client);
 
       try {
-        for (const sub of data) {
-          await upsertSubscriptionHeader(client, sub);
-          rowsUpserted++;
+        let pageNo = 1;
 
-          const lines = Array.isArray(sub.lines) ? sub.lines : [];
-          for (const line of lines) {
-            const { stubInserted } = await upsertSubscriptionLine(client, sub.id, line);
-            rowsUpserted++;
-            if (stubInserted) stubSkusInserted++;
+        while (true) {
+          // fetch page from loop
+          const { data, pageInfo } = await loop.getPaged(LOOP_SUBSCRIPTIONS_PATH, {
+            pageNo,
+            pageSize: PAGE_SIZE,
+          });
+
+          if (!Array.isArray(data) || data.length === 0) break;
+
+          // Transaction per page
+          await client.query("BEGIN");
+          ctx.beginTxn();
+
+          try {
+            for (const sub of data) {
+              await upsertSubscriptionHeader(client, sub);
+              ctx.incrementUpserts(1);
+
+              const lines = Array.isArray(sub.lines) ? sub.lines : [];
+              for (const line of lines) {
+                const { stubInserted } = await upsertSubscriptionLine(client, sub.id, line);
+                ctx.incrementUpserts(1);
+                if (stubInserted) stubSkusInserted++;
+              }
+            }
+
+            await client.query("COMMIT");
+            ctx.endTxn();
+          } catch (e) {
+            await client.query("ROLLBACK");
+            ctx.endTxn();
+            throw e;
           }
+
+          console.log(
+            `[${PIPELINE}] page ${pageNo} done | subs=${data.length} | hasNextPage=${!!pageInfo?.hasNextPage}`
+          );
+
+          if (!pageInfo?.hasNextPage) break;
+          pageNo += 1;
         }
 
-        await client.query("COMMIT");
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
+        // Keep your existing stub metric (best in metadata, not rows_upserted)
+        console.log(`[${PIPELINE}] done | stub_skus_inserted=${stubSkusInserted}`);
+      } finally {
+        client.release();
       }
-
-      console.log(
-        `[${PIPELINE}] page ${pageNo} done | subs=${data.length} | hasNextPage=${!!pageInfo?.hasNextPage}`
-      );
-
-      if (!pageInfo?.hasNextPage) break;
-      pageNo += 1;
     }
-
-    await finishIngestionRun(runId, "succeeded", rowsUpserted + stubSkusInserted, 0, null, {
-      finished_at: new Date().toISOString(),
-      stub_skus_inserted: stubSkusInserted,
-    });
-
-    console.log(`[${PIPELINE}] success | rows_upserted=${rowsUpserted} stubs=${stubSkusInserted}`);
-  } catch (err) {
-    const msg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-
-    await finishIngestionRun(runId, "failed", rowsUpserted + stubSkusInserted, 0, msg, {
-      finished_at: new Date().toISOString(),
-    });
-
-    console.error(`[${PIPELINE}] failed | ${msg}`);
-    process.exitCode = 1;
-  } finally {
-    client.release();
-    await pool.end();
-  }
+  );
 }
 
 main();

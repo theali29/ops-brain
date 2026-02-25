@@ -147,7 +147,7 @@ async function requestWithRetry(method, url, { params, data } = {}, opts = {}) {
 
     if (res.status >= 500 && res.status <= 599) {
       const backoff = Math.min(30000, 500 * 2 ** (attempt - 1));
-      console.warn(`⚠️ ${res.status} server error. Backoff ${backoff}ms (attempt ${attempt}/${maxAttempts})`);
+      console.warn(`${res.status} server error. Backoff ${backoff}ms (attempt ${attempt}/${maxAttempts})`);
       await sleep(backoff);
       continue;
     }

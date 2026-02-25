@@ -3,10 +3,11 @@
 const path = require("path");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 
-const { pool } = require("../config/db");
+const { withIngestionRun } = require("./lib/ingestionRun");
 const { createLoopClient, epochToIso } = require("./lib/loop");
 
 const PIPELINE = "loop_subscriptions_daily";
+const SOURCE = "loop";
 const STATE_KEY = "loop_subscriptions_daily";
 
 const PAGE_SIZE = Math.min(Number(process.env.LOOP_PAGE_SIZE || 50), 50);
@@ -39,44 +40,13 @@ function toNumOrNull(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function startIngestionRun(metadata) {
-  const q = `
-    insert into ops.ingestion_runs (source, pipeline, status, metadata)
-    values ('loop', $1, 'started', $2::jsonb)
-    returning id
-  `;
-  const res = await pool.query(q, [PIPELINE, JSON.stringify(metadata || {})]);
-  return res.rows[0].id;
-}
-
-async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, errorMessage, metadataPatch) {
-  const q = `
-    update ops.ingestion_runs
-    set finished_at = now(),
-        status = $2::ops.sync_status,
-        rows_upserted = $3,
-        rows_deleted = $4,
-        error_message = $5,
-        metadata = metadata || $6::jsonb
-    where id = $1
-  `;
-  await pool.query(q, [
-    runId,
-    status,
-    rowsUpserted || 0,
-    rowsDeleted || 0,
-    errorMessage || null,
-    JSON.stringify(metadataPatch || {}),
-  ]);
-}
-
-async function getSyncCursor(key) {
-  const res = await pool.query("select value from ops.sync_state where key = $1", [key]);
+async function getSyncCursor(client, key) {
+  const res = await client.query("select value from ops.sync_state where key = $1", [key]);
   if (!res.rowCount) return null;
   return res.rows[0].value;
 }
 
-async function setSyncCursor(key, value) {
+async function setSyncCursor(client, key, value) {
   const q = `
     insert into ops.sync_state (key, value, updated_at)
     values ($1, $2::jsonb, now())
@@ -84,7 +54,7 @@ async function setSyncCursor(key, value) {
       value = excluded.value,
       updated_at = now()
   `;
-  await pool.query(q, [key, JSON.stringify(value)]);
+  await client.query(q, [key, JSON.stringify(value)]);
 }
 
 // DB upserts
@@ -342,127 +312,112 @@ async function upsertSubscriptionLine(client, subscriptionId, line) {
 }
 
 async function main() {
-  const cursor = await getSyncCursor(STATE_KEY);
+  await withIngestionRun(
+    {
+      source: SOURCE,
+      pipeline: PIPELINE,
+      metadata: {
+        endpoint: "/subscription",
+        page_size: PAGE_SIZE,
+        overlap_hours: OVERLAP_HOURS,
+        started_at: nowIso(),
+      },
+    },
+    async (ctx) => {
+      let stubSkusInserted = 0;
+      let maxUpdatedAtSeen = null;
 
-  // Canonical cursor: last_end_iso
-  // if old state exists, treat last_max_updated_at as last_end_iso
-  const lastEndIso =
-    cursor?.last_end_iso ||
-    cursor?.last_max_updated_at ||
-    isoDaysAgo(DEFAULT_LOOKBACK_DAYS);
+      const client = await ctx.pool.connect();
+      ctx.setClient(client);
 
-  const windowStartIso = OVERLAP_HOURS > 0 ? isoHoursAgoFrom(lastEndIso, OVERLAP_HOURS) : lastEndIso;
-  const windowEndIso = nowIso();
-
-  const startEpoch = toEpochSec(windowStartIso);
-  const endEpoch = toEpochSec(windowEndIso);
-
-  if (startEpoch === null || endEpoch === null) {
-    throw new Error(`Invalid window ISO: start=${windowStartIso} end=${windowEndIso}`);
-  }
-
-  const runMeta = {
-    page_size: PAGE_SIZE,
-    window_start_iso: windowStartIso,
-    window_end_iso: windowEndIso,
-    updatedAtStartEpoch: startEpoch,
-    updatedAtEndEpoch: endEpoch,
-    overlap_hours: OVERLAP_HOURS,
-    started_at: windowEndIso,
-    prior_cursor: cursor || null,
-  };
-
-  const runId = await startIngestionRun(runMeta);
-
-  console.log(
-    `[${PIPELINE}] start | window=${windowStartIso} -> ${windowEndIso} startEpoch=${startEpoch} endEpoch=${endEpoch} page_size=${PAGE_SIZE}`
-  );
-
-  let rowsUpserted = 0;
-  let stubSkusInserted = 0;
-  let maxUpdatedAtSeen = null;
-
-  const client = await pool.connect();
-
-  try {
-    let pageNo = 1;
-
-    while (true) {
-      const { data, pageInfo } = await loop.getPaged("/subscription", {
-        pageNo,
-        pageSize: PAGE_SIZE,
-        updatedAtStartEpoch: startEpoch,
-        updatedAtEndEpoch: endEpoch,
-      });
-
-      if (!Array.isArray(data) || data.length === 0) break;
-
-      await client.query("BEGIN");
       try {
-        for (const sub of data) {
-          if (sub?.updatedAt) {
-            if (!maxUpdatedAtSeen || Date.parse(sub.updatedAt) > Date.parse(maxUpdatedAtSeen)) {
-              maxUpdatedAtSeen = sub.updatedAt;
-            }
-          }
+        const cursor = await getSyncCursor(client, STATE_KEY);
 
-          await upsertSubscriptionHeader(client, sub);
-          rowsUpserted++;
+        // Canonical cursor: last_end_iso
+        // if old state exists, treat last_max_updated_at as last_end_iso
+        const lastEndIso =
+          cursor?.last_end_iso ||
+          cursor?.last_max_updated_at ||
+          isoDaysAgo(DEFAULT_LOOKBACK_DAYS);
 
-          const lines = Array.isArray(sub.lines) ? sub.lines : [];
-          for (const line of lines) {
-            const { stubInserted } = await upsertSubscriptionLine(client, sub.id, line);
-            rowsUpserted++;
-            if (stubInserted) stubSkusInserted++;
-          }
+        const windowStartIso =
+          OVERLAP_HOURS > 0 ? isoHoursAgoFrom(lastEndIso, OVERLAP_HOURS) : lastEndIso;
+        const windowEndIso = nowIso();
+
+        const startEpoch = toEpochSec(windowStartIso);
+        const endEpoch = toEpochSec(windowEndIso);
+
+        if (startEpoch === null || endEpoch === null) {
+          throw new Error(`Invalid window ISO: start=${windowStartIso} end=${windowEndIso}`);
         }
 
-        await client.query("COMMIT");
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
+        console.log(
+          `[${PIPELINE}] start | window=${windowStartIso} -> ${windowEndIso} startEpoch=${startEpoch} endEpoch=${endEpoch} page_size=${PAGE_SIZE}`
+        );
+
+        let pageNo = 1;
+
+        while (true) {
+          const { data, pageInfo } = await loop.getPaged("/subscription", {
+            pageNo,
+            pageSize: PAGE_SIZE,
+            updatedAtStartEpoch: startEpoch,
+            updatedAtEndEpoch: endEpoch,
+          });
+
+          if (!Array.isArray(data) || data.length === 0) break;
+
+          await client.query("BEGIN");
+          ctx.beginTxn();
+
+          try {
+            for (const sub of data) {
+              if (sub?.updatedAt) {
+                if (!maxUpdatedAtSeen || Date.parse(sub.updatedAt) > Date.parse(maxUpdatedAtSeen)) {
+                  maxUpdatedAtSeen = sub.updatedAt;
+                }
+              }
+
+              await upsertSubscriptionHeader(client, sub);
+              ctx.incrementUpserts(1);
+
+              const lines = Array.isArray(sub.lines) ? sub.lines : [];
+              for (const line of lines) {
+                const { stubInserted } = await upsertSubscriptionLine(client, sub.id, line);
+                ctx.incrementUpserts(1);
+                if (stubInserted) stubSkusInserted++;
+              }
+            }
+
+            await client.query("COMMIT");
+            ctx.endTxn();
+          } catch (e) {
+            await client.query("ROLLBACK");
+            ctx.endTxn();
+            throw e;
+          }
+
+          console.log(
+            `[${PIPELINE}] page ${pageNo} done | returned=${data.length} | hasNextPage=${!!pageInfo?.hasNextPage}`
+          );
+
+          if (!pageInfo?.hasNextPage) break;
+          pageNo += 1;
+        }
+
+        await setSyncCursor(client, STATE_KEY, {
+          last_end_iso: windowEndIso,
+          last_max_updated_at_seen: maxUpdatedAtSeen,
+        });
+
+        console.log(
+          `[${PIPELINE}] success | stub_skus_inserted=${stubSkusInserted} new_last_end_iso=${windowEndIso} maxUpdatedAtSeen=${maxUpdatedAtSeen || "null"}`
+        );
+      } finally {
+        client.release();
       }
-
-      console.log(
-        `[${PIPELINE}] page ${pageNo} done | returned=${data.length} | upserts=${rowsUpserted} | hasNextPage=${!!pageInfo?.hasNextPage}`
-      );
-
-      if (!pageInfo?.hasNextPage) break;
-      pageNo += 1;
     }
-
-    // Canonical state write
-    await setSyncCursor(STATE_KEY, {
-      last_end_iso: windowEndIso,
-      last_max_updated_at_seen: maxUpdatedAtSeen,
-    });
-
-    await finishIngestionRun(runId, "succeeded", rowsUpserted + stubSkusInserted, 0, null, {
-      finished_at: nowIso(),
-      new_state: {
-        last_end_iso: windowEndIso,
-        last_max_updated_at_seen: maxUpdatedAtSeen,
-      },
-      stub_skus_inserted: stubSkusInserted,
-    });
-
-    console.log(
-      `[${PIPELINE}] success | rows_upserted=${rowsUpserted} stubs=${stubSkusInserted} new_last_end_iso=${windowEndIso} maxUpdatedAtSeen=${maxUpdatedAtSeen || "null"}`
-    );
-  } catch (err) {
-    const msg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-
-    await finishIngestionRun(runId, "failed", rowsUpserted + stubSkusInserted, 0, msg, {
-      finished_at: nowIso(),
-      cursor_not_advanced: true,
-    });
-
-    console.error(`[${PIPELINE}] failed | ${msg}`);
-    process.exitCode = 1;
-  } finally {
-    client.release();
-    await pool.end();
-  }
+  );
 }
 
 main();
