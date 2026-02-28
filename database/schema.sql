@@ -134,6 +134,7 @@ create index if not exists refund_line_items_sku_idx
 -- Shopify Inventory (Operational truth for MVP)
 create table if not exists ops.fact_inventory_snapshot (
   id               bigserial primary key,
+  location_id      bigint not null,
   snapshot_date    date not null,
   sku              text not null references ops.dim_sku(sku),
   shopify_variant_id bigint,
@@ -142,19 +143,22 @@ create table if not exists ops.fact_inventory_snapshot (
   source           ops.data_source not null default 'shopify',
   raw              jsonb not null default '{}'::jsonb, -- helpful for debugging location mapping
   ingested_at      timestamptz not null default now(),
-  unique (snapshot_date, sku, location_name)
+  unique (snapshot_date, sku, location_id)
 );
 
 create index if not exists inv_snapshot_sku_date_idx
   on ops.fact_inventory_snapshot (sku, snapshot_date desc);
 
 create or replace view ops.v_latest_inventory as
-select distinct on (sku, location_name)
-  sku, location_name, snapshot_date,
+select distinct on (sku, location_id)
+  sku,
+  location_id,
+  location_name,
+  snapshot_date,
   available,
   ingested_at
 from ops.fact_inventory_snapshot
-order by sku, location_name, snapshot_date desc, ingested_at desc;
+order by sku, location_id, snapshot_date desc, ingested_at desc;
 
 -- Sheets (Planning brain)
 
@@ -194,16 +198,40 @@ create table if not exists ops.fact_demand_forecast (
 create index if not exists demand_forecast_sku_month_idx
   on ops.fact_demand_forecast (sku, month);
 
+
+create table if not exists ops.dim_supply_item (
+  supply_item_key text primary key,
+  description text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists ops.dim_supply_item_sku_map (
+  supply_item_key text not null
+    references ops.dim_supply_item(supply_item_key)
+    on delete cascade,
+
+  sku text not null
+    references ops.dim_sku(sku)
+    on delete cascade,
+
+  primary key (supply_item_key, sku)
+);
+
 -- Reorder policy 
 create table if not exists ops.dim_reorder_rules (
-  sku                      text primary key references ops.dim_sku(sku),
-  lead_time_months          numeric(6,2) not null check (lead_time_months >= 0),
-  safety_buffer_months      numeric(6,2) not null check (safety_buffer_months >= 0),
-  reorder_trigger_months    numeric(6,2) not null check (reorder_trigger_months >= 0),
-  standard_order_qty        integer not null check (standard_order_qty >= 0),
+  supply_item_key text primary key
+    references ops.dim_supply_item(supply_item_key)
+    on delete cascade,
+
+  lead_time_months numeric(6,2) not null check (lead_time_months >= 0),
+  safety_buffer_months numeric(6,2) not null check (safety_buffer_months >= 0),
+  reorder_trigger_months numeric(6,2) not null check (reorder_trigger_months >= 0),
+  standard_order_qty integer not null check (standard_order_qty >= 0),
   min_runway_trigger_months numeric(6,2),
-  source                   ops.data_source not null default 'google_sheets',
-  ingested_at              timestamptz not null default now()
+
+  source ops.data_source not null default 'google_sheets',
+  ingested_at timestamptz not null default now()
 );
 
 -- Unit economics / SKU financials
@@ -474,3 +502,4 @@ create table if not exists ops.dim_offer_economics (
   source ops.data_source not null default 'google_sheets',
   ingested_at timestamptz not null default now()
 );
+
