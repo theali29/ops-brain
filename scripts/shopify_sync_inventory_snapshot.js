@@ -1,8 +1,10 @@
 "use strict";
+
 const path = require("path");
 const axios = require("axios");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 const { pool } = require("../config/db");
+
 const SHOP = (process.env.SHOPIFY_STORE || "").trim();
 const TOKEN = (process.env.SHOPIFY_ADMIN_TOKEN || "").trim();
 const VERSION = (process.env.SHOPIFY_API_VERSION || "2024-10").trim();
@@ -10,13 +12,17 @@ const VERSION = (process.env.SHOPIFY_API_VERSION || "2024-10").trim();
 const PIPELINE = "shopify_inventory_snapshot";
 const LIMIT = 250;
 const RPS = Number(process.env.SHOPIFY_RPS || 2);
-const SNAPSHOT_DATE = (process.env.SNAPSHOT_DATE || "").trim(); 
+const SNAPSHOT_DATE = (process.env.SNAPSHOT_DATE || "").trim();
+
+const INCLUDE_ALL_ROLLUP =
+  String(process.env.INCLUDE_ALL_ROLLUP || "false")
+    .trim()
+    .toLowerCase() === "true";
 
 const LOCATION_NAME_ALLOWLIST = (process.env.LOCATION_NAME_ALLOWLIST || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 
 const INVENTORY_ITEM_ID_CHUNK = 50;
 
@@ -129,7 +135,14 @@ async function startIngestionRun(metadata) {
   return res.rows[0].id;
 }
 
-async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, errorMessage, metadataPatch) {
+async function finishIngestionRun(
+  runId,
+  status,
+  rowsUpserted,
+  rowsDeleted,
+  errorMessage,
+  metadataPatch
+) {
   const q = `
     update ops.ingestion_runs
     set finished_at = now(),
@@ -150,76 +163,85 @@ async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, erro
   ]);
 }
 async function loadSkuInventoryMap() {
-  // We expect inventory item id to exist in attributes from product sync.
   const q = `
     select
       sku,
+      shopify_variant_id,
       coalesce(
         nullif(attributes->>'inventory_item_id',''),
         nullif(attributes->>'shopify_inventory_item_id','')
-      ) as inventory_item_id,
-      shopify_variant_id
+      ) as inventory_item_id
     from ops.dim_sku
     where sku is not null
   `;
   const res = await pool.query(q);
 
-  const invIdToSku = new Map();
+  const invIdToSkuMeta = new Map();
   let withInvId = 0;
 
   for (const r of res.rows) {
     const inv = r.inventory_item_id ? Number(r.inventory_item_id) : null;
     if (Number.isFinite(inv) && inv > 0) {
-      invIdToSku.set(inv, r.sku);
+      invIdToSkuMeta.set(inv, {
+        sku: r.sku,
+        shopify_variant_id: r.shopify_variant_id ? Number(r.shopify_variant_id) : null,
+      });
       withInvId++;
     }
   }
 
-  return { invIdToSku, totalSkus: res.rowCount, skusWithInvId: withInvId };
+  return { invIdToSkuMeta, totalSkus: res.rowCount, skusWithInvId: withInvId };
 }
 
-async function upsertInventorySnapshotRow(client, { snapshotDate, sku, locationId, locationName, available, raw }) {
+async function upsertInventorySnapshotRow(
+  client,
+  { snapshotDate, sku, shopifyVariantId, locationId, locationName, available, raw }
+) {
   const q = `
     insert into ops.fact_inventory_snapshot
       (snapshot_date, sku, shopify_variant_id, location_id, location_name, available, source, raw, ingested_at)
     values
-      ($1::date, $2, null, $3, $4, $5, 'shopify', $6::jsonb, now())
+      ($1::date, $2, $3, $4, $5, $6, 'shopify', $7::jsonb, now())
     on conflict (snapshot_date, sku, location_id) do update set
+      shopify_variant_id = excluded.shopify_variant_id,
+      location_name = excluded.location_name,
       available = excluded.available,
       raw = excluded.raw,
       ingested_at = now()
   `;
   await client.query(q, [
     snapshotDate,
-    sku,         
-    locationId, 
-    locationName, 
-    available,    
-    JSON.stringify(raw || {}), 
+    sku,
+    shopifyVariantId,
+    locationId,
+    locationName,
+    available,
+    JSON.stringify(raw || {}),
   ]);
 }
+
 async function fetchLocations() {
   const res = await requestWithRetry("GET", "/locations.json", { params: { limit: LIMIT } });
   const locations = res.data?.locations || [];
   if (LOCATION_NAME_ALLOWLIST.length) {
+    // Exact name match allowlist
     return locations.filter((l) => LOCATION_NAME_ALLOWLIST.includes(l.name));
   }
   return locations;
 }
 
 async function fetchInventoryLevelsForLocation(locationId, inventoryItemIds) {
-
   let pageInfo = null;
   const out = [];
 
+  const baseParams = {
+    limit: LIMIT,
+    location_ids: String(locationId),
+    inventory_item_ids: inventoryItemIds.join(","),
+  };
+
   while (true) {
-    const params = pageInfo
-      ? { limit: LIMIT, page_info: pageInfo }
-      : {
-          limit: LIMIT,
-          location_ids: String(locationId),
-          inventory_item_ids: inventoryItemIds.join(","),
-        };
+    const params = pageInfo ? { ...baseParams, page_info: pageInfo } : baseParams;
 
     const res = await requestWithRetry("GET", "/inventory_levels.json", { params });
     const levels = res.data?.inventory_levels || [];
@@ -253,7 +275,7 @@ async function main() {
   let rowsUpserted = 0;
 
   try {
-    const { invIdToSku, totalSkus, skusWithInvId } = await loadSkuInventoryMap();
+    const { invIdToSkuMeta, totalSkus, skusWithInvId } = await loadSkuInventoryMap();
     if (!skusWithInvId) {
       throw new Error(
         `No inventory_item_id found in ops.dim_sku.attributes. Update product sync to store inventory_item_id first. totalSkus=${totalSkus}`
@@ -265,41 +287,52 @@ async function main() {
       throw new Error("No Shopify locations returned. Check token permissions or store setup.");
     }
 
-    const allInvIds = Array.from(invIdToSku.keys());
+    const allInvIds = Array.from(invIdToSkuMeta.keys());
     const invChunks = chunk(allInvIds, INVENTORY_ITEM_ID_CHUNK);
 
     const client = await pool.connect();
     try {
       for (const loc of locations) {
-        const locationId = Number(loc.id); 
+        const locationId = Number(loc.id);
         const locationName = loc.name || `location_${loc.id}`;
+        await client.query("begin");
 
-        for (const ids of invChunks) {
-          const levels = await fetchInventoryLevelsForLocation(locationId, ids);
+        try {
+          for (const ids of invChunks) {
+            const levels = await fetchInventoryLevelsForLocation(locationId, ids);
 
-          // Write each returned level
-          for (const lvl of levels) {
-            const invId = Number(lvl.inventory_item_id);
-            const sku = invIdToSku.get(invId);
-            if (!sku) continue;
+            for (const lvl of levels) {
+              const invId = Number(lvl.inventory_item_id);
+              const meta = invIdToSkuMeta.get(invId);
+              if (!meta?.sku) continue;
 
-            const available = Number(lvl.available);
-            await upsertInventorySnapshotRow(client, {
-              snapshotDate,
-              sku,
-              locationId,
-              locationName,
-              available: Number.isFinite(available) ? available : 0,
-              raw: lvl,
-            });
+              const available = Number(lvl.available);
+              const safeAvailable = Number.isFinite(available) ? available : 0;
 
-            rowsUpserted++;
+              await upsertInventorySnapshotRow(client, {
+                snapshotDate,
+                sku: meta.sku,
+                shopifyVariantId: meta.shopify_variant_id,
+                locationId,
+                locationName,
+                available: safeAvailable,
+                raw: lvl,
+              });
+
+              rowsUpserted++;
+            }
           }
+
+          await client.query("commit");
+        } catch (e) {
+          await client.query("rollback");
+          throw e;
         }
       }
     } finally {
       client.release();
     }
+
     await finishIngestionRun(runId, "succeeded", rowsUpserted, 0, null, {
       finished_at: nowIso(),
       total_skus: totalSkus,
@@ -317,4 +350,5 @@ async function main() {
     await pool.end();
   }
 }
+
 main();

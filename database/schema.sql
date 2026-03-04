@@ -215,9 +215,12 @@ create table if not exists ops.dim_supply_item_sku_map (
     references ops.dim_sku(sku)
     on delete cascade,
 
-  primary key (supply_item_key, sku)
-);
+  units_per_sku numeric(12,4) not null default 1,
 
+  primary key (supply_item_key, sku),
+
+  constraint units_per_sku_positive check (units_per_sku > 0)
+);
 -- Reorder policy 
 create table if not exists ops.dim_reorder_rules (
   supply_item_key text primary key
