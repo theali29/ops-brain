@@ -1,20 +1,5 @@
 "use strict";
 
-/**
- * WRITE INGESTION — 2026 Inventory & Cashflow (Inventory/Demand blocks only)
- *
- * Writes:
- *   - ops.sheet_tab_snapshots (raw audit snapshot)
- *   - ops.fact_demand_forecast_supply_item (THM/BRUSH/ROLLER monthly plan)
- *
- * Design:
- *   - Reads Google Sheet via service account (readonly)
- *   - Parses blocks by "Starting Inventory" anchors
- *   - Uses a single DB transaction (BEGIN/COMMIT/ROLLBACK)
- *   - Logs ops.ingestion_runs via withIngestionRun
- *   - Idempotent upsert via unique constraint (source, supply_item_key, month, model_version)
- */
-
 const path = require("path");
 require("dotenv").config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -347,3 +332,8 @@ main().catch((e) => {
   console.error("Fatal:", e.message);
   process.exitCode = 1;
 });
+
+
+
+
+
