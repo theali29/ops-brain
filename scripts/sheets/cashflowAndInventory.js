@@ -235,16 +235,21 @@ function parseSimple(values, mh, { startInvLabel, supplyItemKey, maxSpan = 120 }
     const totalInv = readMonthInt(values, rTotalInv, monthToCol, mKey) ?? 0;
 
     if (newCms === 0 && rebills === 0 && totalInv === 0) continue;
-
+    const impliedTotal = newCms + rebills;
+    if (totalInv !== 0 && impliedTotal !== totalInv) {
+      console.warn(
+        `[${supplyItemKey}] ${month} mismatch: newCms (${newCms}) + rebills (${rebills}) = ${impliedTotal}, totalInv = ${totalInv}`
+      );
+    }
     const sheetRowKey = `${PLAN_YEAR}-${String(mi + 1).padStart(2, "0")}|${supplyItemKey}`;
-
+    //Rebills row as forecast_rebill_1m_units for Brush and Rollers
     rows.push({
       supply_item_key: supplyItemKey,
       month,
       forecast_new_customer_units: newCms,
       forecast_renewal_units: 0,
       forecast_rebill_3m_units: 0,
-      forecast_rebill_1m_units: 0,
+      forecast_rebill_1m_units: rebills, // preserve rebills for simple products
       forecast_total_units: totalInv, // authoritative from sheet
       sheet_row_key: sheetRowKey,
     });
