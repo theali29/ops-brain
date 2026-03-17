@@ -18,6 +18,7 @@ Operational Views / Reporting
 ```
 
 ## Project Structure
+``` text
 ops-brain
 │
 ├── .github/workflows/      # scheduled ingestion jobs
@@ -32,6 +33,7 @@ ops-brain
 │   └── sheets/             # Google Sheets ingestion 
 │
 └── README.md
+```
 
 Ops brain currently intgerates with:
 - Shopify
