@@ -1,6 +1,6 @@
 # OPS Brain
 
-Ops Brain is internal operations intelligence system that gathers operational data from multiple sources into a structed Postgres wareshouse to support decision making.
+Ops Brain is internal operations intelligence system that gathers operational data from multiple sources into a structured Postgres wareshouse to support decision making.
 
 The system ingests data from platforms such as Shopify, Loop Subscriptions, and Google Sheets planning models, and transforms them into a canonical operational data model used for reporting, forecasting, and inventory planning.
 
@@ -44,9 +44,9 @@ Ops brain currently intgerates with:
   - Loop Orders
   - Loop subscriptions
 - Google Sheets
--  demand forecasts
-- inbound shipment planning
-- financial planning models
+  -  demand forecasts
+  - inbound shipment planning
+  - financial planning models
 
 
 ## Running the Project
