@@ -3,7 +3,7 @@
 const path = require("path");
 const axios = require("axios");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
-const { pool } = require("../config/db");
+const { pool } = require("../../config/db");
 
 const SHOP = (process.env.SHOPIFY_STORE || "").trim();
 const TOKEN = (process.env.SHOPIFY_ADMIN_TOKEN || "").trim();

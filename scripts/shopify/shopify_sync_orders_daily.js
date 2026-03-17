@@ -1,26 +1,27 @@
-const fs = require("fs");
+"use strict";
+
 const path = require("path");
 const axios = require("axios");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 
-const { pool } = require("../config/db");
+const { pool } = require("../../config/db");
 
-const SHOP = (process.env.SHOPIFY_STORE || "").trim();
+
+const SHOP = (process.env.SHOPIFY_STORE || "").trim(); 
 const TOKEN = (process.env.SHOPIFY_ADMIN_TOKEN || "").trim();
 const VERSION = (process.env.SHOPIFY_API_VERSION || "2024-10").trim();
 
-// Throttle (requests per second). Shopify Plus is high, but we still keep it conservative.
-const RPS = Number(process.env.SHOPIFY_RPS || 2); // safe default
-const LIMIT = 250; // max per Shopify REST page
-const PIPELINE = "shopify_orders_backfill";
+const PIPELINE = "shopify_orders_daily";
+const STATE_KEY = "shopify_orders_daily";
 
-const MAX_ORDERS = process.env.MAX_ORDERS ? Number(process.env.MAX_ORDERS) : null;
-
+const LIMIT = 250;
+const RPS = Number(process.env.SHOPIFY_RPS || 2); 
 const INSERT_STUB_SKUS = (process.env.INSERT_STUB_SKUS || "true").toLowerCase() !== "false";
 
-// Where we store local resume state
-const STATE_DIR = path.join(process.cwd(), "syncs");
-const STATE_PATH = path.join(STATE_DIR, "shopify_orders_backfill_state.json");
+const DEFAULT_LOOKBACK_DAYS = Number(process.env.DEFAULT_LOOKBACK_DAYS || 7);
+const OVERLAP_HOURS = Number(process.env.OVERLAP_HOURS || 48);
+
+const LOG_EVERY_ORDERS = Number(process.env.LOG_EVERY_ORDERS || 1000);
 
 
 if (!SHOP || !TOKEN) {
@@ -31,6 +32,11 @@ if (!Number.isFinite(RPS) || RPS <= 0) {
   console.error("SHOPIFY_RPS must be a positive number");
   process.exit(1);
 }
+if (!Number.isFinite(OVERLAP_HOURS) || OVERLAP_HOURS < 0) {
+  console.error("OVERLAP_HOURS must be a non-negative number");
+  process.exit(1);
+}
+
 
 const api = axios.create({
   baseURL: `https://${SHOP}/admin/api/${VERSION}`,
@@ -38,9 +44,9 @@ const api = axios.create({
     "X-Shopify-Access-Token": TOKEN,
     "Content-Type": "application/json",
   },
-  timeout: 120000,
-  maxRedirects: 5, // handle 301 -> myshopify redirects safely
-  validateStatus: () => true, // we’ll handle status codes ourselves
+  timeout: 60000,
+  maxRedirects: 5,
+  validateStatus: () => true,
 });
 
 
@@ -50,6 +56,17 @@ function sleep(ms) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isoDaysAgo(days) {
+  const d = new Date(Date.now() - days * 86400 * 1000);
+  return d.toISOString();
+}
+
+function isoHoursAgoFrom(iso, hours) {
+  const base = new Date(iso);
+  const d = new Date(base.getTime() - hours * 3600 * 1000);
+  return d.toISOString();
 }
 
 function parseTags(tags) {
@@ -83,6 +100,10 @@ function sumTaxLines(taxLines) {
   return taxLines.reduce((acc, tl) => acc + moneyToNum(tl.price), 0);
 }
 
+/**
+ * Shopify REST cursor pagination uses Link header:
+ * <https://.../orders.json?...&page_info=XYZ>; rel="next"
+ */
 function extractNextPageInfo(linkHeader) {
   if (!linkHeader) return null;
 
@@ -105,22 +126,6 @@ function extractNextPageInfo(linkHeader) {
   return null;
 }
 
-function loadState() {
-  try {
-    if (!fs.existsSync(STATE_PATH)) return null;
-    const raw = fs.readFileSync(STATE_PATH, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function saveState(state) {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-}
-
-
 let lastRequestAt = 0;
 
 async function requestWithRetry(method, url, { params, data } = {}, opts = {}) {
@@ -130,33 +135,59 @@ async function requestWithRetry(method, url, { params, data } = {}, opts = {}) {
     const minGapMs = Math.ceil(1000 / RPS);
     const elapsed = Date.now() - lastRequestAt;
     if (elapsed < minGapMs) await sleep(minGapMs - elapsed);
-
     lastRequestAt = Date.now();
 
-    const res = await api.request({ method, url, params, data });
-
-    if (res.status >= 200 && res.status < 300) return res;
-
-    if (res.status === 429) {
-      const retryAfter = Number(res.headers["retry-after"] || 1);
-      const waitMs = Math.max(1000, retryAfter * 1000);
-      console.warn(`⚠️ 429 rate limited. Waiting ${waitMs}ms (attempt ${attempt}/${maxAttempts})`);
-      await sleep(waitMs);
-      continue;
-    }
-
-    if (res.status >= 500 && res.status <= 599) {
+    let res;
+    try {
+      res = await api.request({ method, url, params, data });
+    } catch (err) {
       const backoff = Math.min(30000, 500 * 2 ** (attempt - 1));
-      console.warn(`${res.status} server error. Backoff ${backoff}ms (attempt ${attempt}/${maxAttempts})`);
+      if (attempt === maxAttempts) throw err;
       await sleep(backoff);
       continue;
     }
 
+    if (res.status >= 200 && res.status < 300) return res;
+
+    // Rate limit
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers["retry-after"] || 1);
+      const waitMs = Math.max(1000, retryAfter * 1000);
+      await sleep(waitMs);
+      continue;
+    }
+
+    // Transient server errors
+    if (res.status >= 500 && res.status <= 599) {
+      const backoff = Math.min(30000, 500 * 2 ** (attempt - 1));
+      await sleep(backoff);
+      continue;
+    }
+
+    // Non-retryable
     const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
     throw new Error(`HTTP ${res.status}: ${body}`);
   }
 
   throw new Error(`Request failed after ${maxAttempts} attempts`);
+}
+
+
+async function getSyncCursor(key) {
+  const res = await pool.query("select value from ops.sync_state where key = $1", [key]);
+  if (!res.rowCount) return null;
+  return res.rows[0].value;
+}
+
+async function setSyncCursor(key, value) {
+  const q = `
+    insert into ops.sync_state (key, value, updated_at)
+    values ($1, $2::jsonb, now())
+    on conflict (key) do update set
+      value = excluded.value,
+      updated_at = now()
+  `;
+  await pool.query(q, [key, JSON.stringify(value)]);
 }
 
 async function startIngestionRun(metadata) {
@@ -169,17 +200,25 @@ async function startIngestionRun(metadata) {
   return res.rows[0].id;
 }
 
-async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, errorMessage) {
+async function finishIngestionRun(runId, status, rowsUpserted, rowsDeleted, errorMessage, metadataPatch) {
   const q = `
     update ops.ingestion_runs
     set finished_at = now(),
         status = $2::ops.sync_status,
         rows_upserted = $3,
         rows_deleted = $4,
-        error_message = $5
+        error_message = $5,
+        metadata = metadata || $6::jsonb
     where id = $1
   `;
-  await pool.query(q, [runId, status, rowsUpserted || 0, rowsDeleted || 0, errorMessage || null]);
+  await pool.query(q, [
+    runId,
+    status,
+    rowsUpserted || 0,
+    rowsDeleted || 0,
+    errorMessage || null,
+    JSON.stringify(metadataPatch || {}),
+  ]);
 }
 
 async function upsertOrder(client, order) {
@@ -230,7 +269,6 @@ async function upsertOrder(client, order) {
 }
 
 async function ensureSkuExists(client, sku, { productTitle, variantTitle, productId, variantId } = {}) {
-  // If sku already exists, no-op (fast path)
   const check = await client.query("select 1 from ops.dim_sku where sku = $1 limit 1", [sku]);
   if (check.rowCount) return false;
 
@@ -248,8 +286,8 @@ async function ensureSkuExists(client, sku, { productTitle, variantTitle, produc
 
   const attributes = {
     stub: true,
-    stub_reason: "seen_in_order_line_item_backfill",
-    created_by: "shopify_orders_backfill",
+    stub_reason: "seen_in_order_line_item_daily_sync",
+    created_by: PIPELINE,
     created_at: nowIso(),
   };
 
@@ -318,7 +356,7 @@ async function upsertLineItem(client, orderId, orderTagsArr, li) {
     sku,
     li.product_id ?? null,
     li.variant_id ?? null,
-    null, 
+    null, // inventory_item_id not provided on REST line_item
     li.title ?? null,
     li.variant_title ?? null,
     qty,
@@ -339,7 +377,6 @@ async function upsertRefunds(client, order) {
   let refundLines = 0;
 
   for (const r of refunds) {
-    // Refund header
     const qh = `
       insert into ops.fact_shopify_refunds
         (refund_id, order_id, created_at_refund, note, source, raw, ingested_at)
@@ -364,8 +401,10 @@ async function upsertRefunds(client, order) {
     const rlis = Array.isArray(r.refund_line_items) ? r.refund_line_items : [];
     for (const x of rlis) {
       const li = x.line_item || {};
+      const lineItemId = li.id ?? x.line_item_id ?? null;
       const sku = (li.sku || "").trim() || null;
 
+      // If we have SKU, satisfy FK best-effort
       if (sku) {
         await ensureSkuExists(client, sku, {
           productTitle: li.title ?? null,
@@ -377,24 +416,48 @@ async function upsertRefunds(client, order) {
 
       const refundAmount =
         moneyToNum(x.subtotal) ||
-        moneyToNum(x.total_tax) ||
         moneyToNum(x.amount) ||
+        moneyToNum(x.total_tax) ||
         0;
 
-      const ql = `
-        insert into ops.fact_shopify_refund_line_items
-          (refund_id, order_id, line_item_id, sku, quantity, refund_amount, source, ingested_at)
-        values
-          ($1,$2,$3,$4,$5,$6,'shopify', now())
-      `;
-      await client.query(ql, [
-        r.id,
-        order.id,
-        li.id ?? x.line_item_id ?? null,
-        sku,
-        x.quantity ?? 0,
-        refundAmount,
-      ]);
+      // Upsert line item if possible (requires unique index on (refund_id, line_item_id))
+      // If lineItemId is null, we cannot safely de-dupe; we still insert best-effort.
+      if (lineItemId != null) {
+        const ql = `
+          insert into ops.fact_shopify_refund_line_items
+            (refund_id, order_id, line_item_id, sku, quantity, refund_amount, source, ingested_at)
+          values
+            ($1,$2,$3,$4,$5,$6,'shopify', now())
+          on conflict (refund_id, line_item_id) do update set
+            sku = excluded.sku,
+            quantity = excluded.quantity,
+            refund_amount = excluded.refund_amount,
+            ingested_at = now()
+        `;
+        await client.query(ql, [
+          r.id,
+          order.id,
+          lineItemId,
+          sku,
+          x.quantity ?? 0,
+          refundAmount,
+        ]);
+      } else {
+        const ql = `
+          insert into ops.fact_shopify_refund_line_items
+            (refund_id, order_id, line_item_id, sku, quantity, refund_amount, source, ingested_at)
+          values
+            ($1,$2,$3,$4,$5,$6,'shopify', now())
+        `;
+        await client.query(ql, [
+          r.id,
+          order.id,
+          null,
+          sku,
+          x.quantity ?? 0,
+          refundAmount,
+        ]);
+      }
 
       refundLines++;
     }
@@ -404,60 +467,60 @@ async function upsertRefunds(client, order) {
 }
 
 async function main() {
-  const startMeta = {
+  // Read durable cursor
+  const cursor = await getSyncCursor(STATE_KEY);
+
+  // We store: { last_max_updated_at: "..." }
+  const lastMax = cursor?.last_max_updated_at || isoDaysAgo(DEFAULT_LOOKBACK_DAYS);
+
+  // Apply overlap (prevents missing edge updates)
+  const updatedAtMin = OVERLAP_HOURS > 0 ? isoHoursAgoFrom(lastMax, OVERLAP_HOURS) : lastMax;
+
+  const runMeta = {
     shop: SHOP,
     version: VERSION,
-    limit: LIMIT,
     rps: RPS,
-    started_at: nowIso(),
-    max_orders: MAX_ORDERS,
-    state_path: STATE_PATH,
-    insert_stub_skus: INSERT_STUB_SKUS,
-  };
-
-  const runId = await startIngestionRun(startMeta);
-
-  const state = loadState() || {
-    page_info: null,
-    pages_done: 0,
-    orders_done: 0,
-    last_order_id: null,
+    limit: LIMIT,
+    last_max_updated_at: lastMax,
+    updated_at_min: updatedAtMin,
+    overlap_hours: OVERLAP_HOURS,
     started_at: nowIso(),
   };
 
-  console.log("Shopify Orders Backfill");
-  console.log("RPS:", RPS);
-  console.log("RESUME STATE:", state.page_info ? "YES (page_info present)" : "NO (starting fresh)");
+  const runId = await startIngestionRun(runMeta);
+
+  console.log(
+    `[${PIPELINE}] start | updated_at_min=${updatedAtMin} | overlap_hours=${OVERLAP_HOURS} | rps=${RPS}`
+  );
+
+  const client = await pool.connect();
 
   let ordersUpserted = 0;
   let lineItemsUpserted = 0;
   let lineItemsSkippedNoSku = 0;
   let stubSkusInserted = 0;
   let refundHeadersUpserted = 0;
-  let refundLineItemsInserted = 0;
+  let refundLinesUpserted = 0;
 
-  const client = await pool.connect();
+  let maxUpdatedAtSeen = lastMax; // persist as watermark only on success
+  let pageInfo = null;
 
   try {
-    let pageInfo = state.page_info;
-
     while (true) {
-      if (MAX_ORDERS != null && ordersUpserted >= MAX_ORDERS) {
-        console.log(`Reached MAX_ORDERS=${MAX_ORDERS}. Stopping.`);
-        break;
-      }
-
       const params = pageInfo
         ? {
             limit: LIMIT,
             page_info: pageInfo,
-            fields: "id,order_number,processed_at,created_at,currency,financial_status,fulfillment_status,cancelled_at,cancel_reason,tags,test,customer,line_items,refunds",
+            fields:
+              "id,order_number,processed_at,created_at,updated_at,currency,financial_status,fulfillment_status,cancelled_at,cancel_reason,tags,test,customer,line_items,refunds",
           }
         : {
             limit: LIMIT,
             status: "any",
-            order: "created_at asc",
-            fields: "id,order_number,processed_at,created_at,currency,financial_status,fulfillment_status,cancelled_at,cancel_reason,tags,test,customer,line_items,refunds",
+            order: "updated_at asc",
+            updated_at_min: updatedAtMin,
+            fields:
+              "id,order_number,processed_at,created_at,updated_at,currency,financial_status,fulfillment_status,cancelled_at,cancel_reason,tags,test,customer,line_items,refunds",
           };
 
       const res = await requestWithRetry("GET", "/orders.json", { params });
@@ -466,106 +529,95 @@ async function main() {
         throw new Error(`Unexpected status ${res.status}: ${JSON.stringify(res.data)}`);
       }
 
-      const orders = (res.data && res.data.orders) || [];
-      const nextPageInfo = extractNextPageInfo(res.headers && res.headers.link);
+      const orders = res.data?.orders || [];
+      const nextPageInfo = extractNextPageInfo(res.headers?.link);
 
-      if (!orders.length) {
-        console.log("No more orders returned. Done.");
-        break;
-      }
+      if (!orders.length) break;
 
       for (const o of orders) {
         await client.query("BEGIN");
-
         try {
           const tagsArr = await upsertOrder(client, o);
           ordersUpserted++;
-          state.orders_done++;
-          state.last_order_id = o.id;
+
+          const u = o.updated_at || o.processed_at || o.created_at;
+          if (u && new Date(u) > new Date(maxUpdatedAtSeen)) {
+            maxUpdatedAtSeen = u;
+          }
 
           for (const li of o.line_items || []) {
-            const result = await upsertLineItem(client, o.id, tagsArr, li);
-
-            if (result.skippedNoSku) {
+            const out = await upsertLineItem(client, o.id, tagsArr, li);
+            if (out.skippedNoSku) {
               lineItemsSkippedNoSku++;
               continue;
             }
-
-            if (result.stubInserted) stubSkusInserted++;
+            if (out.stubInserted) stubSkusInserted++;
             lineItemsUpserted++;
           }
 
           const { refundHeaders, refundLines } = await upsertRefunds(client, o);
           refundHeadersUpserted += refundHeaders;
-          refundLineItemsInserted += refundLines;
+          refundLinesUpserted += refundLines;
 
           await client.query("COMMIT");
-        } catch (err) {
+        } catch (e) {
           await client.query("ROLLBACK");
-          throw err;
+          throw e;
         }
 
-        if (ordersUpserted % 500 === 0) {
+        if (ordersUpserted % LOG_EVERY_ORDERS === 0) {
           console.log(
-            `Progress: orders=${ordersUpserted}, line_items=${lineItemsUpserted}, skipped_no_sku=${lineItemsSkippedNoSku}, stubs=${stubSkusInserted}, refunds=${refundHeadersUpserted}`
+            `[${PIPELINE}] progress | orders=${ordersUpserted} line_items=${lineItemsUpserted} refunds=${refundHeadersUpserted}`
           );
-          saveState({
-            ...state,
-            page_info: nextPageInfo, // best available “continue” pointer
-            pages_done: state.pages_done,
-            updated_at: nowIso(),
-          });
         }
       }
 
-      state.pages_done++;
       pageInfo = nextPageInfo;
-
-      saveState({
-        ...state,
-        page_info: pageInfo,
-        updated_at: nowIso(),
-      });
-
-      console.log(
-        `Page ${state.pages_done} done. Orders so far=${ordersUpserted}. Next page=${pageInfo ? "YES" : "NO"}`
-      );
-
       if (!pageInfo) break;
     }
 
+    // Update checkpoint only on success (durable, no local files)
+    await setSyncCursor(STATE_KEY, { last_max_updated_at: maxUpdatedAtSeen });
+
     const rowsUpserted =
       ordersUpserted +
       lineItemsUpserted +
+      stubSkusInserted +
       refundHeadersUpserted +
-      refundLineItemsInserted +
-      stubSkusInserted;
+      refundLinesUpserted;
 
-    await finishIngestionRun(runId, "succeeded", rowsUpserted, 0, null);
+    await finishIngestionRun(
+      runId,
+      "succeeded",
+      rowsUpserted,
+      0,
+      null,
+      { finished_at: nowIso(), new_cursor: maxUpdatedAtSeen }
+    );
 
-    console.log("✅ Backfill succeeded");
-    console.log({
-      ordersUpserted,
-      lineItemsUpserted,
-      lineItemsSkippedNoSku,
-      stubSkusInserted,
-      refundHeadersUpserted,
-      refundLineItemsInserted,
-      pages: state.pages_done,
-      stateFile: STATE_PATH,
-    });
+    console.log(
+      `[${PIPELINE}] ok | orders=${ordersUpserted} line_items=${lineItemsUpserted} refunds=${refundHeadersUpserted} new_cursor=${maxUpdatedAtSeen}`
+    );
   } catch (err) {
     const msg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error("❌ Backfill failed:", msg);
 
     const rowsUpserted =
       ordersUpserted +
       lineItemsUpserted +
+      stubSkusInserted +
       refundHeadersUpserted +
-      refundLineItemsInserted +
-      stubSkusInserted;
+      refundLinesUpserted;
 
-    await finishIngestionRun(runId, "failed", rowsUpserted, 0, msg);
+    await finishIngestionRun(
+      runId,
+      "failed",
+      rowsUpserted,
+      0,
+      msg,
+      { finished_at: nowIso(), cursor_not_advanced: true }
+    );
+
+    console.error(`[${PIPELINE}] failed | ${msg}`);
     process.exitCode = 1;
   } finally {
     client.release();

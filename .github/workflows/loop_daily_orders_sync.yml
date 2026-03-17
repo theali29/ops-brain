@@ -21,7 +21,7 @@ jobs:
       - run: npm ci
 
       - name: Run Loop orders daily sync
-        run: node scripts/loop_sync_orders_daily.js
+        run: node scripts/loop/loop_sync_orders_daily.js
         env:
           LOOP_BASE_URL: ${{ secrets.LOOP_BASE_URL }}
           LOOP_ADMIN_TOKEN: ${{ secrets.LOOP_ADMIN_TOKEN }}
