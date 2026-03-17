@@ -1,63 +1,20 @@
 "use strict";
 
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+require("dotenv").config({ path: path.resolve(__dirname, "../../.env") });
 
-const { withIngestionRun } = require("./lib/ingestionRun");
-const { createLoopClient, epochToIso } = require("./lib/loop");
+const { withIngestionRun } = require("../lib/ingestionRun");
+const { createLoopClient, epochToIso } = require("../lib/loop");
 
-const PIPELINE = "loop_subscriptions_daily";
+const PIPELINE = "loop_subscriptions_backfill";
 const SOURCE = "loop";
-const STATE_KEY = "loop_subscriptions_daily";
-
 const PAGE_SIZE = Math.min(Number(process.env.LOOP_PAGE_SIZE || 50), 50);
-const DEFAULT_LOOKBACK_DAYS = Number(process.env.DEFAULT_LOOKBACK_DAYS || 7);
-const OVERLAP_HOURS = Number(process.env.OVERLAP_HOURS || 48);
+
+const LOOP_SUBSCRIPTIONS_PATH = "/subscription";
 
 const loop = createLoopClient();
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function isoDaysAgo(days) {
-  return new Date(Date.now() - days * 86400 * 1000).toISOString();
-}
-
-function isoHoursAgoFrom(iso, hours) {
-  const base = new Date(iso);
-  return new Date(base.getTime() - hours * 3600 * 1000).toISOString();
-}
-
-function toEpochSec(iso) {
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
-}
-
-function toNumOrNull(x) {
-  if (x === null || x === undefined) return null;
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function getSyncCursor(client, key) {
-  const res = await client.query("select value from ops.sync_state where key = $1", [key]);
-  if (!res.rowCount) return null;
-  return res.rows[0].value;
-}
-
-async function setSyncCursor(client, key, value) {
-  const q = `
-    insert into ops.sync_state (key, value, updated_at)
-    values ($1, $2::jsonb, now())
-    on conflict (key) do update set
-      value = excluded.value,
-      updated_at = now()
-  `;
-  await client.query(q, [key, JSON.stringify(value)]);
-}
-
-// DB upserts
+// ---- DB upserts ----
 async function upsertSubscriptionHeader(client, sub) {
   const nextBillingAtIso = epochToIso(sub.nextBillingDateEpoch);
 
@@ -162,9 +119,9 @@ async function upsertSubscriptionHeader(client, sub) {
     sub.lastPaymentStatus ?? null,
     sub.currencyCode ?? null,
 
-    toNumOrNull(sub.totalLineItemPrice),
-    toNumOrNull(sub.totalLineItemDiscountedPrice),
-    toNumOrNull(sub.deliveryPrice),
+    sub.totalLineItemPrice ?? null,
+    sub.totalLineItemDiscountedPrice ?? null,
+    sub.deliveryPrice ?? null,
 
     sub.nextBillingDateEpoch ?? null,
     nextBillingAtIso,
@@ -296,9 +253,9 @@ async function upsertSubscriptionLine(client, subscriptionId, line) {
     line.variantTitle ?? null,
     line.name ?? null,
 
-    toNumOrNull(line.price),
-    toNumOrNull(line.basePrice),
-    toNumOrNull(line.discountedPrice),
+    line.price != null ? Number(line.price) : null,
+    line.basePrice != null ? Number(line.basePrice) : null,
+    line.discountedPrice != null ? Number(line.discountedPrice) : null,
 
     line.isOneTimeAdded ?? null,
     line.isOneTimeRemoved ?? null,
@@ -317,67 +274,35 @@ async function main() {
       source: SOURCE,
       pipeline: PIPELINE,
       metadata: {
-        endpoint: "/subscription",
+        endpoint: LOOP_SUBSCRIPTIONS_PATH,
         page_size: PAGE_SIZE,
-        overlap_hours: OVERLAP_HOURS,
-        started_at: nowIso(),
+        started_at: new Date().toISOString(),
       },
     },
     async (ctx) => {
       let stubSkusInserted = 0;
-      let maxUpdatedAtSeen = null;
 
       const client = await ctx.pool.connect();
       ctx.setClient(client);
 
       try {
-        const cursor = await getSyncCursor(client, STATE_KEY);
-
-        // Canonical cursor: last_end_iso
-        // if old state exists, treat last_max_updated_at as last_end_iso
-        const lastEndIso =
-          cursor?.last_end_iso ||
-          cursor?.last_max_updated_at ||
-          isoDaysAgo(DEFAULT_LOOKBACK_DAYS);
-
-        const windowStartIso =
-          OVERLAP_HOURS > 0 ? isoHoursAgoFrom(lastEndIso, OVERLAP_HOURS) : lastEndIso;
-        const windowEndIso = nowIso();
-
-        const startEpoch = toEpochSec(windowStartIso);
-        const endEpoch = toEpochSec(windowEndIso);
-
-        if (startEpoch === null || endEpoch === null) {
-          throw new Error(`Invalid window ISO: start=${windowStartIso} end=${windowEndIso}`);
-        }
-
-        console.log(
-          `[${PIPELINE}] start | window=${windowStartIso} -> ${windowEndIso} startEpoch=${startEpoch} endEpoch=${endEpoch} page_size=${PAGE_SIZE}`
-        );
-
         let pageNo = 1;
 
         while (true) {
-          const { data, pageInfo } = await loop.getPaged("/subscription", {
+          // fetch page from loop
+          const { data, pageInfo } = await loop.getPaged(LOOP_SUBSCRIPTIONS_PATH, {
             pageNo,
             pageSize: PAGE_SIZE,
-            updatedAtStartEpoch: startEpoch,
-            updatedAtEndEpoch: endEpoch,
           });
 
           if (!Array.isArray(data) || data.length === 0) break;
 
+          // Transaction per page
           await client.query("BEGIN");
           ctx.beginTxn();
 
           try {
             for (const sub of data) {
-              if (sub?.updatedAt) {
-                if (!maxUpdatedAtSeen || Date.parse(sub.updatedAt) > Date.parse(maxUpdatedAtSeen)) {
-                  maxUpdatedAtSeen = sub.updatedAt;
-                }
-              }
-
               await upsertSubscriptionHeader(client, sub);
               ctx.incrementUpserts(1);
 
@@ -398,21 +323,15 @@ async function main() {
           }
 
           console.log(
-            `[${PIPELINE}] page ${pageNo} done | returned=${data.length} | hasNextPage=${!!pageInfo?.hasNextPage}`
+            `[${PIPELINE}] page ${pageNo} done | subs=${data.length} | hasNextPage=${!!pageInfo?.hasNextPage}`
           );
 
           if (!pageInfo?.hasNextPage) break;
           pageNo += 1;
         }
 
-        await setSyncCursor(client, STATE_KEY, {
-          last_end_iso: windowEndIso,
-          last_max_updated_at_seen: maxUpdatedAtSeen,
-        });
-
-        console.log(
-          `[${PIPELINE}] success | stub_skus_inserted=${stubSkusInserted} new_last_end_iso=${windowEndIso} maxUpdatedAtSeen=${maxUpdatedAtSeen || "null"}`
-        );
+        // Keep your existing stub metric (best in metadata, not rows_upserted)
+        console.log(`[${PIPELINE}] done | stub_skus_inserted=${stubSkusInserted}`);
       } finally {
         client.release();
       }

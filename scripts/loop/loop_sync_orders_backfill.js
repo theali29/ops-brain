@@ -1,10 +1,10 @@
 "use strict";
 
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+require("dotenv").config({ path: path.resolve(__dirname, "../../.env") });
 
-const { withIngestionRun } = require("./lib/ingestionRun"); 
-const { createLoopClient, epochToIso } = require("./lib/loop");
+const { withIngestionRun } = require("../lib/ingestionRun"); 
+const { createLoopClient, epochToIso } = require("../lib/loop");
 
 const PIPELINE = "loop_orders_backfill";
 const SOURCE = "loop";

@@ -34,7 +34,6 @@ ops-brain
 │
 └── README.md
 ```
-
 Ops brain currently intgerates with:
 - Shopify
   -  orders

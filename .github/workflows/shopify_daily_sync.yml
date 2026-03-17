@@ -18,7 +18,7 @@ jobs:
 
       - run: npm install
 
-      - run: node scripts/shopify_sync_orders_daily.js
+      - run: node scripts/shopify/shopify_sync_orders_daily.js
         env:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
