@@ -56,13 +56,13 @@ Install dependencies:
 ```bash
 npm install
 
-node scripts/shopify/syncOrders.js
+node scripts/shopify/shopify_sync_orders_daily.js
 ```
 
 ### Example:
 
 ``` bash
-node scripts/loop/syncSubscriptions.js
+node scripts/loop/loop_sync_orders_daily.js
 node scripts/sheets/inboundShipments.js
 ```
 
