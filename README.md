@@ -4,7 +4,7 @@ Ops Brain is internal operations intelligence system that gathers operational da
 
 The system ingests data from platforms such as Shopify, Loop Subscriptions, and Google Sheets planning models, and transforms them into a canonical operational data model used for reporting, forecasting, and inventory planning.
 
-Ops brain acts as the single operational truth laer for revenue, subscriptions, inventory and demand forecasting.
+Ops brain acts as the single operational truth layer for revenue, subscriptions, inventory and demand forecasting.
 
 ## System Architecture
 ``` text
